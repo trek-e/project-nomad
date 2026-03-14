@@ -42,14 +42,8 @@ admin/public/assets
 # Admin specific development files
 admin/storage
 
-# ── GSD baseline (auto-generated) ──
-.gsd/activity/
-.gsd/runtime/
-.gsd/worktrees/
-.gsd/auto.lock
-.gsd/metrics.json
-.gsd/completed-units.json
-.gsd/STATE.md
+# ── GSD (local development only — never send upstream) ──
+.gsd/
 Thumbs.db
 *.swp
 *.swo
@@ -71,3 +65,4 @@ vendor/
 coverage/
 .cache/
 tmp/
+.bg-shell/
