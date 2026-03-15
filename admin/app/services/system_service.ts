@@ -127,6 +127,75 @@ export class SystemService {
     }
   }
 
+  /**
+   * Query AMD GPU info via rocm-smi inside the Ollama (ROCm) container.
+   * Returns GPU details array, or a status string if unavailable.
+   */
+  async getRocmSmiInfo(): Promise<Array<{ model: string; vram: number }> | 'OLLAMA_NOT_FOUND' | 'PASSTHROUGH_FAILED' | 'UNKNOWN_ERROR'> {
+    try {
+      const containers = await this.dockerService.docker.listContainers({ all: false })
+      const ollamaContainer = containers.find((c) =>
+        c.Names.includes(`/${SERVICE_NAMES.OLLAMA}`)
+      )
+      if (!ollamaContainer) {
+        return 'OLLAMA_NOT_FOUND'
+      }
+
+      const container = this.dockerService.docker.getContainer(ollamaContainer.Id)
+      const rocmExec = await container.exec({
+        Cmd: ['rocm-smi', '--showproductname', '--showmeminfo', 'vram', '--csv'],
+        AttachStdout: true,
+        AttachStderr: true,
+        Tty: true,
+      })
+
+      const stream = await rocmExec.start({ Tty: true })
+      const output = await new Promise<string>((resolve) => {
+        let data = ''
+        const timeout = setTimeout(() => resolve(data), 5000)
+        stream.on('data', (chunk: Buffer) => { data += chunk.toString() })
+        stream.on('end', () => { clearTimeout(timeout); resolve(data) })
+      })
+
+      const cleaned = output.replace(/[\x00-\x08]/g, '').trim()
+      if (!cleaned || cleaned.toLowerCase().includes('error') || cleaned.toLowerCase().includes('not found')) {
+        logger.warn(`[SystemService] rocm-smi returned: ${cleaned}`)
+        return 'PASSTHROUGH_FAILED'
+      }
+
+      // Parse CSV output from rocm-smi
+      // Format varies but typically: device, Card series, Card model, Card vendor, Card SKU
+      // and memory lines: device, VRAM Total Memory (B), VRAM Total Used Memory (B)
+      const lines = cleaned.split('\n').filter((l) => l.trim() && !l.startsWith('device'))
+
+      // Try to extract model and VRAM from the output
+      const gpus: Array<{ model: string; vram: number }> = []
+      let currentModel = 'AMD GPU'
+      let currentVram = 0
+
+      for (const line of lines) {
+        const parts = line.split(',').map((s) => s.trim())
+        // Product name line typically has the card series/model
+        if (parts.length >= 2 && !parts[1].match(/^\d+$/)) {
+          currentModel = parts.slice(1).filter(Boolean).join(' ') || 'AMD GPU'
+        }
+        // VRAM line has numeric values (in bytes)
+        if (parts.length >= 2 && parts[1].match(/^\d+$/)) {
+          currentVram = Math.round(parseInt(parts[1], 10) / (1024 * 1024)) // bytes to MB
+        }
+      }
+
+      if (currentModel) {
+        gpus.push({ model: currentModel, vram: currentVram })
+      }
+
+      return gpus.length > 0 ? gpus : 'PASSTHROUGH_FAILED'
+    } catch (error) {
+      logger.error('[SystemService] Error getting rocm-smi info:', error)
+      return 'UNKNOWN_ERROR'
+    }
+  }
+
   async getServices({ installedOnly = true }: { installedOnly?: boolean }): Promise<ServiceSlim[]> {
     await this._syncContainersWithDatabase() // Sync up before fetching to ensure we have the latest status
 
@@ -240,10 +309,12 @@ export class SystemService {
         logger.error('Error reading disk info file:', error)
       }
 
-      // GPU health tracking — detect when host has NVIDIA GPU but Ollama can't access it
+      // GPU health tracking — detect when host has GPU but Ollama can't access it
       let gpuHealth: GpuHealthStatus = {
         status: 'no_gpu',
+        gpuType: 'none',
         hasNvidiaRuntime: false,
+        hasAmdGpu: false,
         ollamaGpuAccessible: false,
       }
 
@@ -263,11 +334,12 @@ export class SystemService {
         }
 
         // If si.graphics() returned no controllers (common inside Docker),
-        // fall back to nvidia runtime + nvidia-smi detection
+        // fall back to runtime detection + GPU query tools
         if (!graphics.controllers || graphics.controllers.length === 0) {
           const runtimes = dockerInfo.Runtimes || {}
           if ('nvidia' in runtimes) {
             gpuHealth.hasNvidiaRuntime = true
+            gpuHealth.gpuType = 'nvidia'
             const nvidiaInfo = await this.getNvidiaSmiInfo()
             if (Array.isArray(nvidiaInfo)) {
               graphics.controllers = nvidiaInfo.map((gpu) => ({
@@ -285,11 +357,55 @@ export class SystemService {
               gpuHealth.status = 'passthrough_failed'
               logger.warn(`NVIDIA runtime detected but GPU passthrough failed: ${typeof nvidiaInfo === 'string' ? nvidiaInfo : JSON.stringify(nvidiaInfo)}`)
             }
+          } else {
+            // Check for AMD GPU via rocm-smi inside Ollama container
+            const amdInfo = await this.getRocmSmiInfo()
+            if (Array.isArray(amdInfo)) {
+              gpuHealth.hasAmdGpu = true
+              gpuHealth.gpuType = 'amd'
+              graphics.controllers = amdInfo.map((gpu) => ({
+                model: gpu.model,
+                vendor: 'AMD',
+                bus: '',
+                vram: gpu.vram,
+                vramDynamic: false,
+              }))
+              gpuHealth.status = 'ok'
+              gpuHealth.ollamaGpuAccessible = true
+            } else if (amdInfo === 'OLLAMA_NOT_FOUND') {
+              // Try host-level detection via lspci
+              try {
+                const execAsync = promisify(exec)
+                const { stdout } = await execAsync(
+                  'lspci 2>/dev/null | grep -iE "VGA|3D controller|Display" | grep -iE "amd|radeon" || true'
+                )
+                if (stdout.trim()) {
+                  gpuHealth.hasAmdGpu = true
+                  gpuHealth.gpuType = 'amd'
+                  gpuHealth.status = 'ollama_not_installed'
+                }
+              } catch {
+                // lspci not available
+              }
+            } else if (amdInfo === 'PASSTHROUGH_FAILED') {
+              gpuHealth.hasAmdGpu = true
+              gpuHealth.gpuType = 'amd'
+              gpuHealth.status = 'passthrough_failed'
+            }
           }
         } else {
           // si.graphics() returned controllers (host install, not Docker) — GPU is working
           gpuHealth.status = 'ok'
           gpuHealth.ollamaGpuAccessible = true
+          // Determine GPU type from vendor string
+          const vendors = graphics.controllers.map((c) => (c.vendor || '').toLowerCase())
+          if (vendors.some((v) => v.includes('nvidia'))) {
+            gpuHealth.gpuType = 'nvidia'
+            gpuHealth.hasNvidiaRuntime = true
+          } else if (vendors.some((v) => v.includes('amd') || v.includes('radeon'))) {
+            gpuHealth.gpuType = 'amd'
+            gpuHealth.hasAmdGpu = true
+          }
         }
       } catch {
         // Docker info query failed, skip host-level enrichment

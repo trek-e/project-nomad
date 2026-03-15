@@ -328,6 +328,72 @@ setup_nvidia_container_toolkit() {
   echo -e "${GREEN}#${RESET} NVIDIA container toolkit configuration completed.\\n"
 }
 
+setup_amd_gpu() {
+  # This function checks for AMD GPU support and validates ROCm readiness.
+  # Non-blocking — failures are warnings only.
+  # AMD GPU support in Docker doesn't need a special runtime like NVIDIA.
+  # It requires: amdgpu kernel driver loaded, /dev/kfd and /dev/dri/* accessible,
+  # and the user running Docker in the video/render groups.
+
+  echo -e "${YELLOW}#${RESET} Checking for AMD GPU...\\n"
+
+  local has_amd_gpu=false
+  if command -v lspci &> /dev/null; then
+    if lspci 2>/dev/null | grep -iE "VGA|3D controller|Display" | grep -iE "amd|radeon" &> /dev/null; then
+      has_amd_gpu=true
+      echo -e "${GREEN}#${RESET} AMD GPU detected.\\n"
+    fi
+  fi
+
+  if ! $has_amd_gpu; then
+    echo -e "${YELLOW}#${RESET} No AMD GPU detected. Skipping AMD GPU setup.\\n"
+    return 0
+  fi
+
+  # Check for amdgpu kernel driver
+  if lsmod 2>/dev/null | grep -q amdgpu; then
+    echo -e "${GREEN}#${RESET} amdgpu kernel driver is loaded.\\n"
+  else
+    echo -e "${YELLOW}#${RESET} Warning: amdgpu kernel driver not detected. AMD GPU acceleration may not work.\\n"
+    echo -e "${YELLOW}#${RESET} If you have a supported AMD GPU (RDNA2/RDNA3/CDNA), ensure the amdgpu driver is installed.\\n"
+  fi
+
+  # Check for /dev/kfd (Kernel Fusion Driver — required for ROCm compute)
+  if [[ -e /dev/kfd ]]; then
+    echo -e "${GREEN}#${RESET} /dev/kfd device found (ROCm compute interface).\\n"
+  else
+    echo -e "${YELLOW}#${RESET} Warning: /dev/kfd not found. ROCm GPU compute will not be available.\\n"
+    echo -e "${YELLOW}#${RESET} This device is created by the amdgpu driver for supported GPUs.\\n"
+    return 0
+  fi
+
+  # Check for /dev/dri render nodes
+  if [[ -d /dev/dri ]] && ls /dev/dri/renderD* &>/dev/null; then
+    local render_nodes
+    render_nodes=$(ls /dev/dri/renderD* 2>/dev/null | wc -l)
+    echo -e "${GREEN}#${RESET} Found ${render_nodes} DRI render node(s) in /dev/dri/.\\n"
+  else
+    echo -e "${YELLOW}#${RESET} Warning: No DRI render nodes found in /dev/dri/. GPU acceleration may not work.\\n"
+  fi
+
+  # Ensure current user is in video and render groups (needed for /dev/kfd and /dev/dri access)
+  local groups_added=false
+  for group_name in video render; do
+    if getent group "$group_name" &>/dev/null; then
+      if ! groups 2>/dev/null | grep -qw "$group_name"; then
+        echo -e "${YELLOW}#${RESET} Adding current user to '${group_name}' group...\\n"
+        sudo usermod -aG "$group_name" "$(whoami)" 2>/dev/null && groups_added=true
+      fi
+    fi
+  done
+
+  if $groups_added; then
+    echo -e "${YELLOW}#${RESET} Group membership updated. You may need to log out and back in for changes to take effect.\\n"
+  fi
+
+  echo -e "${GREEN}#${RESET} AMD GPU setup completed. The AI Assistant will use ROCm acceleration when installed.\\n"
+}
+
 get_install_confirmation(){
   read -p "This script will install/update Project N.O.M.A.D. and its dependencies on your machine. Are you sure you want to continue? (y/N): " choice
   case "$choice" in
@@ -531,6 +597,8 @@ verify_gpu_setup() {
   echo -e "\\n${YELLOW}#${RESET} GPU Setup Verification\\n"
   echo -e "${YELLOW}===========================================${RESET}\\n"
   
+  local gpu_ready=false
+
   # Check if NVIDIA GPU is present
   if command -v nvidia-smi &> /dev/null; then
     echo -e "${GREEN}✓${RESET} NVIDIA GPU detected:"
@@ -538,41 +606,61 @@ verify_gpu_setup() {
       echo -e "  ${WHITE_R}$line${RESET}"
     done
     echo ""
-  else
-    echo -e "${YELLOW}○${RESET} No NVIDIA GPU detected (nvidia-smi not available)\\n"
   fi
   
   # Check if NVIDIA Container Toolkit is installed
   if command -v nvidia-ctk &> /dev/null; then
     echo -e "${GREEN}✓${RESET} NVIDIA Container Toolkit installed: $(nvidia-ctk --version 2>/dev/null | head -n1)\\n"
-  else
-    echo -e "${YELLOW}○${RESET} NVIDIA Container Toolkit not installed\\n"
   fi
   
   # Check if Docker has NVIDIA runtime
   if docker info 2>/dev/null | grep -q \"nvidia\"; then
     echo -e "${GREEN}✓${RESET} Docker NVIDIA runtime configured\\n"
-  else
-    echo -e "${YELLOW}○${RESET} Docker NVIDIA runtime not detected\\n"
+    gpu_ready=true
   fi
   
   # Check for AMD GPU
   if command -v lspci &> /dev/null; then
-    if lspci 2>/dev/null | grep -iE "amd|radeon" &> /dev/null; then
-      echo -e "${YELLOW}○${RESET} AMD GPU detected (ROCm support not currently available)\\n"
+    if lspci 2>/dev/null | grep -iE "VGA|3D controller|Display" | grep -iE "amd|radeon" &> /dev/null; then
+      echo -e "${GREEN}✓${RESET} AMD GPU detected:"
+      lspci 2>/dev/null | grep -iE "VGA|3D controller|Display" | grep -iE "amd|radeon" | while read -r line; do
+        echo -e "  ${WHITE_R}${line##*: }${RESET}"
+      done
+      echo ""
+
+      if [[ -e /dev/kfd ]]; then
+        echo -e "${GREEN}✓${RESET} ROCm compute interface (/dev/kfd) available\\n"
+        gpu_ready=true
+      else
+        echo -e "${YELLOW}○${RESET} /dev/kfd not found — ROCm compute not available\\n"
+      fi
+
+      if [[ -d /dev/dri ]] && ls /dev/dri/renderD* &>/dev/null 2>&1; then
+        echo -e "${GREEN}✓${RESET} DRI render nodes available\\n"
+      else
+        echo -e "${YELLOW}○${RESET} No DRI render nodes found\\n"
+      fi
     fi
+  fi
+
+  if ! $gpu_ready && ! command -v nvidia-smi &>/dev/null; then
+    echo -e "${YELLOW}○${RESET} No GPU acceleration detected\\n"
   fi
   
   echo -e "${YELLOW}===========================================${RESET}\\n"
   
   # Summary
-  if command -v nvidia-smi &> /dev/null && docker info 2>/dev/null | grep -q \"nvidia\"; then
+  if $gpu_ready; then
     echo -e "${GREEN}#${RESET} GPU acceleration is properly configured! The AI Assistant will use your GPU.\\n"
   else
     echo -e "${YELLOW}#${RESET} GPU acceleration not detected. The AI Assistant will run in CPU-only mode.\\n"
     if command -v nvidia-smi &> /dev/null && ! docker info 2>/dev/null | grep -q \"nvidia\"; then
-      echo -e "${YELLOW}#${RESET} Tip: Your GPU is detected but Docker runtime is not configured.\\n"
+      echo -e "${YELLOW}#${RESET} Tip: Your NVIDIA GPU is detected but Docker runtime is not configured.\\n"
       echo -e "${YELLOW}#${RESET} Try restarting Docker: ${WHITE_R}sudo systemctl restart docker${RESET}\\n"
+    fi
+    if command -v lspci &>/dev/null && lspci 2>/dev/null | grep -iE "VGA|3D controller|Display" | grep -iE "amd|radeon" &>/dev/null && [[ ! -e /dev/kfd ]]; then
+      echo -e "${YELLOW}#${RESET} Tip: Your AMD GPU is detected but /dev/kfd is missing.\\n"
+      echo -e "${YELLOW}#${RESET} Ensure the amdgpu kernel driver is loaded: ${WHITE_R}sudo modprobe amdgpu${RESET}\\n"
     fi
   fi
 }
@@ -603,6 +691,7 @@ get_install_confirmation
 accept_terms
 ensure_docker_installed
 setup_nvidia_container_toolkit
+setup_amd_gpu
 get_local_ip
 create_nomad_directory
 download_wait_for_it_script
