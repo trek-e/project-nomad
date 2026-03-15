@@ -315,6 +315,7 @@ export class SystemService {
         gpuType: 'none',
         hasNvidiaRuntime: false,
         hasAmdGpu: false,
+        hasIntelGpu: false,
         ollamaGpuAccessible: false,
       }
 
@@ -392,6 +393,42 @@ export class SystemService {
               gpuHealth.gpuType = 'amd'
               gpuHealth.status = 'passthrough_failed'
             }
+
+            // If still no GPU detected, check for Intel Arc via lspci
+            if (gpuHealth.gpuType === 'none') {
+              try {
+                const execAsync = promisify(exec)
+                const { stdout: intelCheck } = await execAsync(
+                  'lspci 2>/dev/null | grep -iE "VGA|3D controller|Display" | grep -i intel || true'
+                )
+                if (intelCheck.trim() && /arc|dg[12]|battlemage|alchemist/i.test(intelCheck)) {
+                  gpuHealth.hasIntelGpu = true
+                  gpuHealth.gpuType = 'intel'
+                  // Check if Ollama is running (it would use Vulkan)
+                  const containers = await this.dockerService.docker.listContainers({ all: false })
+                  const ollamaRunning = containers.some((c) => c.Names.includes(`/${SERVICE_NAMES.OLLAMA}`))
+                  if (ollamaRunning) {
+                    // Assume Vulkan is working if Ollama is running with Intel config
+                    gpuHealth.status = 'ok'
+                    gpuHealth.ollamaGpuAccessible = true
+
+                    // Extract model from lspci output
+                    const modelMatch = intelCheck.match(/:\s*(.+)/)?.[1] || 'Intel Arc GPU'
+                    graphics.controllers = [{
+                      model: modelMatch.trim(),
+                      vendor: 'Intel',
+                      bus: '',
+                      vram: 0,
+                      vramDynamic: false,
+                    }]
+                  } else {
+                    gpuHealth.status = 'ollama_not_installed'
+                  }
+                }
+              } catch {
+                // lspci not available
+              }
+            }
           }
         } else {
           // si.graphics() returned controllers (host install, not Docker) — GPU is working
@@ -405,6 +442,13 @@ export class SystemService {
           } else if (vendors.some((v) => v.includes('amd') || v.includes('radeon'))) {
             gpuHealth.gpuType = 'amd'
             gpuHealth.hasAmdGpu = true
+          } else if (vendors.some((v) => v.includes('intel'))) {
+            // Check if it's a discrete Intel GPU (Arc) vs integrated
+            const models = graphics.controllers.map((c) => (c.model || '').toLowerCase())
+            if (models.some((m) => /arc|dg[12]|battlemage|alchemist/i.test(m))) {
+              gpuHealth.gpuType = 'intel'
+              gpuHealth.hasIntelGpu = true
+            }
           }
         }
       } catch {

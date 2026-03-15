@@ -394,6 +394,75 @@ setup_amd_gpu() {
   echo -e "${GREEN}#${RESET} AMD GPU setup completed. The AI Assistant will use ROCm acceleration when installed.\\n"
 }
 
+setup_intel_gpu() {
+  # This function checks for Intel Arc GPU support and validates device access.
+  # Non-blocking — failures are warnings only.
+  # Intel Arc GPUs use Vulkan via the standard Ollama image (OLLAMA_VULKAN=1).
+  # Requires: i915 or xe kernel driver, /dev/dri/* accessible, render group membership.
+
+  echo -e "${YELLOW}#${RESET} Checking for Intel Arc GPU...\\n"
+
+  local has_intel_arc=false
+  if command -v lspci &> /dev/null; then
+    local intel_gpus
+    intel_gpus=$(lspci 2>/dev/null | grep -iE "VGA|3D controller|Display" | grep -i intel || true)
+    if [[ -n "$intel_gpus" ]]; then
+      # Distinguish discrete Arc GPUs from integrated UHD/Iris
+      if echo "$intel_gpus" | grep -iE "arc|dg[12]|battlemage|alchemist" &>/dev/null; then
+        has_intel_arc=true
+        echo -e "${GREEN}#${RESET} Intel Arc GPU detected:"
+        echo "$intel_gpus" | grep -iE "arc|dg[12]|battlemage|alchemist" | while read -r line; do
+          echo -e "  ${WHITE_R}${line##*: }${RESET}"
+        done
+        echo ""
+      else
+        echo -e "${YELLOW}#${RESET} Intel integrated GPU detected (UHD/Iris) — insufficient VRAM for LLM inference.\\n"
+        return 0
+      fi
+    fi
+  fi
+
+  if ! $has_intel_arc; then
+    echo -e "${YELLOW}#${RESET} No Intel Arc GPU detected. Skipping Intel GPU setup.\\n"
+    return 0
+  fi
+
+  # Check for i915 or xe kernel driver
+  if lsmod 2>/dev/null | grep -qE "^i915|^xe"; then
+    local driver_name
+    driver_name=$(lsmod 2>/dev/null | grep -oE "^i915|^xe" | head -1)
+    echo -e "${GREEN}#${RESET} Intel GPU kernel driver loaded: ${driver_name}\\n"
+  else
+    echo -e "${YELLOW}#${RESET} Warning: Neither i915 nor xe kernel driver detected. Intel GPU acceleration may not work.\\n"
+  fi
+
+  # Check for /dev/dri render nodes
+  if [[ -d /dev/dri ]] && ls /dev/dri/renderD* &>/dev/null; then
+    local render_nodes
+    render_nodes=$(ls /dev/dri/renderD* 2>/dev/null | wc -l)
+    echo -e "${GREEN}#${RESET} Found ${render_nodes} DRI render node(s) in /dev/dri/.\\n"
+  else
+    echo -e "${YELLOW}#${RESET} Warning: No DRI render nodes found in /dev/dri/. GPU acceleration may not work.\\n"
+  fi
+
+  # Ensure current user is in video and render groups
+  local groups_added=false
+  for group_name in video render; do
+    if getent group "$group_name" &>/dev/null; then
+      if ! groups 2>/dev/null | grep -qw "$group_name"; then
+        echo -e "${YELLOW}#${RESET} Adding current user to '${group_name}' group...\\n"
+        sudo usermod -aG "$group_name" "$(whoami)" 2>/dev/null && groups_added=true
+      fi
+    fi
+  done
+
+  if $groups_added; then
+    echo -e "${YELLOW}#${RESET} Group membership updated. You may need to log out and back in for changes to take effect.\\n"
+  fi
+
+  echo -e "${GREEN}#${RESET} Intel Arc GPU setup completed. The AI Assistant will use Vulkan acceleration when installed.\\n"
+}
+
 get_install_confirmation(){
   read -p "This script will install/update Project N.O.M.A.D. and its dependencies on your machine. Are you sure you want to continue? (y/N): " choice
   case "$choice" in
@@ -643,6 +712,26 @@ verify_gpu_setup() {
     fi
   fi
 
+  # Check for Intel Arc GPU
+  if command -v lspci &> /dev/null; then
+    local intel_gpus
+    intel_gpus=$(lspci 2>/dev/null | grep -iE "VGA|3D controller|Display" | grep -i intel || true)
+    if echo "$intel_gpus" | grep -iE "arc|dg[12]|battlemage|alchemist" &>/dev/null; then
+      echo -e "${GREEN}✓${RESET} Intel Arc GPU detected:"
+      echo "$intel_gpus" | grep -iE "arc|dg[12]|battlemage|alchemist" | while read -r line; do
+        echo -e "  ${WHITE_R}${line##*: }${RESET}"
+      done
+      echo ""
+
+      if [[ -d /dev/dri ]] && ls /dev/dri/renderD* &>/dev/null 2>&1; then
+        echo -e "${GREEN}✓${RESET} DRI render nodes available (Vulkan)\\n"
+        gpu_ready=true
+      else
+        echo -e "${YELLOW}○${RESET} No DRI render nodes found\\n"
+      fi
+    fi
+  fi
+
   if ! $gpu_ready && ! command -v nvidia-smi &>/dev/null; then
     echo -e "${YELLOW}○${RESET} No GPU acceleration detected\\n"
   fi
@@ -692,6 +781,7 @@ accept_terms
 ensure_docker_installed
 setup_nvidia_container_toolkit
 setup_amd_gpu
+setup_intel_gpu
 get_local_ip
 create_nomad_directory
 download_wait_for_it_script

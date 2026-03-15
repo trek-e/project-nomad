@@ -2,9 +2,10 @@ import { Systeminformation } from 'systeminformation'
 
 export type GpuHealthStatus = {
   status: 'ok' | 'passthrough_failed' | 'no_gpu' | 'ollama_not_installed'
-  gpuType: 'nvidia' | 'amd' | 'none'
+  gpuType: 'nvidia' | 'amd' | 'intel' | 'none'
   hasNvidiaRuntime: boolean
   hasAmdGpu: boolean
+  hasIntelGpu: boolean
   ollamaGpuAccessible: boolean
 }
 
